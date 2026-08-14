@@ -45,3 +45,13 @@ pre-commit install --hook-type pre-push
 ```
 
 Execute the pre-commit manually via `pre-commit run` or `pre-commit run --all-files` to run it on all files.
+
+### GitHub Pages publishing safeguards
+
+The documentation publish workflow enforces GitHub Pages limits:
+
+- hard fail if projected `gh-pages` size exceeds 1 GB,
+- early warning when projected size exceeds 900 MiB,
+- retention pruning of old PR previews by count and total preview size.
+
+The daily maintenance workflow also monitors `gh-pages` size and opens/updates an issue when warning or hard thresholds are breached.
