@@ -38,3 +38,82 @@ on:
 jobs:
   maintenance:
     uses: eclipse-score/cicd-workflows/.github/workflows/daily.yml@829b3e11ccbf924a5782f7bfed647cb1619fdf78 # v0.0.1
+
+  gh-pages-budget-monitor:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_PAGES_WARN_LIMIT_BYTES: "943718400" # 900 MiB
+      GH_PAGES_HARD_LIMIT_BYTES: "1073741824" # 1 GiB
+      ISSUE_TITLE: "GitHub Pages size warning"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: gh-pages
+          path: gh-pages-content
+          fetch-depth: 0
+
+      - name: Check gh-pages size thresholds
+        id: budget
+        run: |
+          python .github/scripts/gh_pages_guard.py check-threshold \
+            --gh-pages-dir gh-pages-content \
+            --warn-limit-bytes "${GH_PAGES_WARN_LIMIT_BYTES}" \
+            --hard-limit-bytes "${GH_PAGES_HARD_LIMIT_BYTES}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Open or update warning issue
+        if: steps.budget.outputs.status != 'ok'
+        uses: actions/github-script@v7
+        env:
+          STATUS: ${{ steps.budget.outputs.status }}
+          TOTAL_BYTES: ${{ steps.budget.outputs.total_bytes }}
+          WARN_BYTES: ${{ env.GH_PAGES_WARN_LIMIT_BYTES }}
+          HARD_BYTES: ${{ env.GH_PAGES_HARD_LIMIT_BYTES }}
+          TITLE: ${{ env.ISSUE_TITLE }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = process.env.TITLE;
+            const status = process.env.STATUS;
+            const total = Number(process.env.TOTAL_BYTES || "0");
+            const warn = Number(process.env.WARN_BYTES || "0");
+            const hard = Number(process.env.HARD_BYTES || "0");
+            const level = status === "hard" ? "HARD LIMIT EXCEEDED" : "Warning threshold exceeded";
+            const body = [
+              `Automated gh-pages budget monitor detected **${level}**.`,
+              "",
+              `- Current size: \`${total}\` bytes`,
+              `- Warning threshold: \`${warn}\` bytes`,
+              `- Hard limit: \`${hard}\` bytes`,
+              "",
+              "Action: prune old PR previews and/or reduce preview payload size."
+            ].join("\n");
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: "open", per_page: 100
+            });
+            const existing = issues.find((i) => i.title === title);
+            if (existing) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner, repo, title, body, labels: ["maintenance"]
+              });
+            }
+
+      - name: Add healthy summary
+        if: steps.budget.outputs.status == 'ok'
+        run: |
+          {
+            echo "### GitHub Pages budget monitor"
+            echo "- Status: healthy"
+            echo "- Current size: ${{ steps.budget.outputs.total_bytes }} bytes"
+          } >> "$GITHUB_STEP_SUMMARY"

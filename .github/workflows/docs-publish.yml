@@ -18,13 +18,327 @@ on:
     workflows: ["PR Checks"]
     types: [completed]
 
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
 jobs:
   docs-deploy:
+    # gh-pages size guard runs before deploy and prevents pushes over 1 GB.
     if: github.event.workflow_run.conclusion == 'success'
-    uses: eclipse-score/cicd-workflows/.github/workflows/docs-publish.yml@206a795e30d45de82d541206fde17abe98d2b4bf
     permissions:
       actions: read
       contents: write
       id-token: write
       pages: write
       pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # GitHub Pages limits:
+      # - hard content limit: 1 GB (enforced below)
+      # - soft bandwidth: 100 GB/month (mitigated by pruning large previews)
+      GH_PAGES_HARD_LIMIT_BYTES: "1073741824"
+      GH_PAGES_WARN_LIMIT_BYTES: "943718400" # 900 MiB
+      GH_PAGES_MAX_PR_DIRS: "20"
+      GH_PAGES_MAX_PR_BYTES: "629145600" # 600 MiB
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+
+      - name: Resolve build metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO_OWNER: ${{ github.event.workflow_run.head_repository.owner.login || '' }}
+          EVENT_NAME: ${{ github.event.workflow_run.event }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number || '' }}
+          REF_NAME: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
+            if [[ -z "$PR_NUMBER" && -n "$HEAD_REPO_OWNER" && -n "$REF_NAME" ]]; then
+              PR_NUMBER="$(curl -fsSL \
+                -H "Authorization: ******" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/pulls?state=open&head=${HEAD_REPO_OWNER}:${REF_NAME}" \
+                | jq -r '.[0].number // empty' || true)"
+            fi
+
+            if [[ -z "$PR_NUMBER" ]]; then
+              echo "Could not determine PR number for pull_request event." >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "$PR_NUMBER" == "null" ]]; then
+            PR_NUMBER=""
+          fi
+
+          if [[ -z "$REF_NAME" && "$EVENT_NAME" != "merge_group" ]]; then
+            echo "The triggering workflow run did not provide a source ref." >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "merge_group" ]]; then
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -n "$PR_NUMBER" ]]; then
+            echo "is_pr_context=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_pr_context=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "event_name=$EVENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "ref_name=$REF_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Determine target folder
+        if: steps.metadata.outputs.should_deploy == 'true'
+        id: target
+        env:
+          PR_NUMBER: ${{ steps.metadata.outputs.pr_number }}
+          REF_NAME: ${{ steps.metadata.outputs.ref_name }}
+        run: |
+          if [[ -n "$PR_NUMBER" ]]; then
+            echo "folder=pr-$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          else
+            echo "folder=$REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure gh-pages branch exists with initial files
+        if: steps.metadata.outputs.should_deploy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          if ! git ls-remote --exit-code --heads "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" gh-pages; then
+            echo "gh-pages branch does not exist. Creating it..."
+            git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" repo
+            cd repo
+            git fetch origin main --depth=1
+            AUTHOR_NAME=$(git log origin/main -1 --pretty=format:'%an')
+            AUTHOR_EMAIL=$(git log origin/main -1 --pretty=format:'%ae')
+            git config user.name "$AUTHOR_NAME"
+            git config user.email "$AUTHOR_EMAIL"
+
+            git checkout --orphan gh-pages
+            git rm -rf . || true
+            REPO_NAME=$(basename "${REPO}")
+            OWNER_NAME="${REPO%%/*}"
+
+            cat > versions.json <<EOF
+            [
+              {
+                "version": "main",
+                "url": "https://${OWNER_NAME}.github.io/${REPO_NAME}/main/"
+              }
+            ]
+            EOF
+
+            cat > index.html <<EOF
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta http-equiv="refresh" content="0; URL=main/">
+                <title>Redirecting...</title>
+            </head>
+            <body>
+                <p>If you are not redirected, <a href="main/">click here</a>.</p>
+            </body>
+            </html>
+            EOF
+
+            touch .nojekyll
+            git add versions.json index.html .nojekyll
+            git commit -m "Initialize gh-pages branch with versions.json and index.html"
+            git push origin gh-pages
+            cd ..
+            rm -rf repo
+          else
+            echo "gh-pages branch exists. Skipping creation."
+          fi
+
+      - name: Checkout gh-pages
+        if: steps.metadata.outputs.should_deploy == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: gh-pages
+          path: gh-pages-content
+          fetch-depth: 0
+
+      - name: Download documentation artifact
+        if: steps.metadata.outputs.should_deploy == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: github-pages
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: staged-docs
+
+      - name: Measure new docs payload size
+        if: steps.metadata.outputs.should_deploy == 'true'
+        id: payload
+        run: |
+          SIZE_BYTES="$(du -sb staged-docs | awk '{print $1}')"
+          echo "new_size_bytes=${SIZE_BYTES}" >> "$GITHUB_OUTPUT"
+          echo "New docs payload size: ${SIZE_BYTES} bytes"
+
+      - name: Enforce PR preview retention budget
+        if: steps.metadata.outputs.should_deploy == 'true'
+        id: retention
+        run: |
+          python .github/scripts/gh_pages_guard.py prune \
+            --gh-pages-dir gh-pages-content \
+            --max-pr-dirs "${GH_PAGES_MAX_PR_DIRS}" \
+            --max-pr-bytes "${GH_PAGES_MAX_PR_BYTES}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Guard against gh-pages size limit
+        if: steps.metadata.outputs.should_deploy == 'true'
+        id: quota
+        run: |
+          python .github/scripts/gh_pages_guard.py guard \
+            --gh-pages-dir gh-pages-content \
+            --target-folder "${{ steps.target.outputs.folder }}" \
+            --new-size-bytes "${{ steps.payload.outputs.new_size_bytes }}" \
+            --warn-limit-bytes "${GH_PAGES_WARN_LIMIT_BYTES}" \
+            --hard-limit-bytes "${GH_PAGES_HARD_LIMIT_BYTES}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish quota summary to logs
+        if: steps.metadata.outputs.should_deploy == 'true'
+        run: |
+          {
+            echo "### GitHub Pages quota preflight"
+            echo "- Current total: ${{ steps.quota.outputs.current_total_bytes }} bytes"
+            echo "- Existing target size: ${{ steps.quota.outputs.current_target_bytes }} bytes"
+            echo "- New payload size: ${{ steps.quota.outputs.new_size_bytes }} bytes"
+            echo "- Projected total: ${{ steps.quota.outputs.projected_total_bytes }} bytes"
+            echo "- Warning threshold: ${GH_PAGES_WARN_LIMIT_BYTES} bytes"
+            echo "- Hard limit: ${GH_PAGES_HARD_LIMIT_BYTES} bytes"
+            echo "- Retention evicted previews: ${{ steps.retention.outputs.removed_count }}"
+            echo "- Retention bytes removed: ${{ steps.retention.outputs.removed_bytes }}"
+            echo "- Remaining preview count: ${{ steps.retention.outputs.remaining_pr_count }}"
+            echo "- Remaining preview bytes: ${{ steps.retention.outputs.remaining_pr_bytes }}"
+            echo "- PR preview breakdown JSON: \`${{ steps.quota.outputs.pr_breakdown_json }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Replace target folder content
+        if: steps.metadata.outputs.should_deploy == 'true'
+        env:
+          TARGET_FOLDER: ${{ steps.target.outputs.folder }}
+        run: |
+          rm -rf "gh-pages-content/${TARGET_FOLDER}"
+          mkdir -p "gh-pages-content/${TARGET_FOLDER}"
+          cp -a staged-docs/. "gh-pages-content/${TARGET_FOLDER}/"
+
+      - name: Ensure .nojekyll exists
+        if: steps.metadata.outputs.should_deploy == 'true'
+        run: touch gh-pages-content/.nojekyll
+
+      - name: Extend versions.json
+        if: steps.metadata.outputs.should_deploy == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.folder }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          if [ ! -f gh-pages-content/versions.json ]; then
+            echo '[]' > gh-pages-content/versions.json
+          fi
+
+          if jq -e --arg v "$TARGET" 'map(select(.version == $v)) | length > 0' gh-pages-content/versions.json > /dev/null; then
+            echo "Version '$TARGET' already exists in versions.json"
+          else
+            REPO_NAME=$(basename "$REPOSITORY")
+            OWNER_NAME="$REPOSITORY_OWNER"
+            PAGES_URL="https://${OWNER_NAME}.github.io/${REPO_NAME}"
+            jq --arg v "$TARGET" --arg u "${PAGES_URL}/${TARGET}/" \
+              '. + [{"version": $v, "url": $u}]' gh-pages-content/versions.json > gh-pages-content/tmp.json
+            mv gh-pages-content/tmp.json gh-pages-content/versions.json
+          fi
+
+      - name: Commit and push changes to gh-pages
+        if: steps.metadata.outputs.should_deploy == 'true'
+        env:
+          TARGET_FOLDER: ${{ steps.target.outputs.folder }}
+        run: |
+          cd gh-pages-content
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update documentation for $TARGET_FOLDER" || echo "No changes to commit"
+          git push
+
+      - name: Remove git metadata before creating Pages artifact
+        if: steps.metadata.outputs.should_deploy == 'true'
+        run: rm -rf gh-pages-content/.git
+
+      - name: Create artifact from gh-pages
+        if: steps.metadata.outputs.should_deploy == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: gh-pages-content
+
+      - name: Deploy artifact to GitHub Pages
+        if: steps.metadata.outputs.should_deploy == 'true'
+        id: deploy-pages
+        timeout-minutes: 10
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+      - name: Find existing PR comment
+        if: steps.metadata.outputs.should_deploy == 'true' && steps.metadata.outputs.pr_number != ''
+        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
+        id: find-pr-comment
+        with:
+          issue-number: ${{ steps.metadata.outputs.pr_number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: Documentation preview for this pull request
+
+      - name: Comment on PR with preview and quota details
+        if: steps.metadata.outputs.should_deploy == 'true' && steps.metadata.outputs.pr_number != '' && steps.find-pr-comment.outputs.comment-id == ''
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
+        with:
+          issue-number: ${{ steps.metadata.outputs.pr_number }}
+          body: |
+            Documentation preview for this pull request is available at:
+            **${{ steps.target.outputs.folder }}**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ steps.target.outputs.folder }}/
+
+            GitHub Pages quota preflight:
+            - Current total: `${{ steps.quota.outputs.current_total_bytes }}` bytes
+            - Existing target size: `${{ steps.quota.outputs.current_target_bytes }}` bytes
+            - New payload size: `${{ steps.quota.outputs.new_size_bytes }}` bytes
+            - Projected total: `${{ steps.quota.outputs.projected_total_bytes }}` bytes
+            - Warning threshold: `${{ env.GH_PAGES_WARN_LIMIT_BYTES }}` bytes
+            - Hard limit: `${{ env.GH_PAGES_HARD_LIMIT_BYTES }}` bytes
+            - Retention evicted previews: `${{ steps.retention.outputs.removed_count }}`
+            - Retention bytes removed: `${{ steps.retention.outputs.removed_bytes }}` bytes
+            - PR preview breakdown JSON: `${{ steps.quota.outputs.pr_breakdown_json }}`
+
+      - name: Update PR comment with preview and quota details
+        if: steps.metadata.outputs.should_deploy == 'true' && steps.metadata.outputs.pr_number != '' && steps.find-pr-comment.outputs.comment-id != ''
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
+        with:
+          comment-id: ${{ steps.find-pr-comment.outputs.comment-id }}
+          edit-mode: replace
+          body: |
+            Documentation preview for this pull request is available at:
+            **${{ steps.target.outputs.folder }}**: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ steps.target.outputs.folder }}/
+
+            GitHub Pages quota preflight:
+            - Current total: `${{ steps.quota.outputs.current_total_bytes }}` bytes
+            - Existing target size: `${{ steps.quota.outputs.current_target_bytes }}` bytes
+            - New payload size: `${{ steps.quota.outputs.new_size_bytes }}` bytes
+            - Projected total: `${{ steps.quota.outputs.projected_total_bytes }}` bytes
+            - Warning threshold: `${{ env.GH_PAGES_WARN_LIMIT_BYTES }}` bytes
+            - Hard limit: `${{ env.GH_PAGES_HARD_LIMIT_BYTES }}` bytes
+            - Retention evicted previews: `${{ steps.retention.outputs.removed_count }}`
+            - Retention bytes removed: `${{ steps.retention.outputs.removed_bytes }}` bytes
+            - PR preview breakdown JSON: `${{ steps.quota.outputs.pr_breakdown_json }}`
