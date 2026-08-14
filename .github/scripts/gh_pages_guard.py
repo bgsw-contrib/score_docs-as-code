@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -121,12 +122,13 @@ def _remove_index_links(index_path: Path, removed_folders: set[str]) -> None:
 
 
 def _human_mb(size_bytes: int) -> str:
-    return f"{(size_bytes / (1024 * 1024)):.2f} MB"
+    return f"{(size_bytes / (1024 * 1024)):.2f} MiB"
 
 
 def _emit_outputs(path: Path, values: dict[str, object]) -> None:
     lines = [f"{k}={v}" for k, v in values.items()]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
@@ -147,7 +149,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
         victim = kept.pop(0)
         target = root / victim.name
         if target.exists():
-            subprocess.run(["rm", "-rf", str(target)], check=True)
+            shutil.rmtree(target)
         removed.append(victim)
 
     removed_names = {d.name for d in removed}
@@ -156,14 +158,15 @@ def cmd_prune(args: argparse.Namespace) -> int:
         _remove_index_links(root / "index.html", removed_names)
 
     current_total = _root_size_bytes(root)
-    current_pr_total = sum(d.size_bytes for d in _pr_dirs(root))
+    remaining_pr_dirs = _pr_dirs(root)
+    current_pr_total = sum(d.size_bytes for d in remaining_pr_dirs)
     print(
         json.dumps(
             {
                 "removed": [d.name for d in removed],
                 "removed_count": len(removed),
                 "removed_bytes": sum(d.size_bytes for d in removed),
-                "remaining_pr_count": len(_pr_dirs(root)),
+                "remaining_pr_count": len(remaining_pr_dirs),
                 "remaining_pr_bytes": current_pr_total,
                 "current_total_bytes": current_total,
             }
@@ -177,7 +180,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
                 "removed_count": len(removed),
                 "removed_folders": ",".join(sorted(removed_names)),
                 "removed_bytes": sum(d.size_bytes for d in removed),
-                "remaining_pr_count": len(_pr_dirs(root)),
+                "remaining_pr_count": len(remaining_pr_dirs),
                 "remaining_pr_bytes": current_pr_total,
                 "current_total_bytes": current_total,
             },

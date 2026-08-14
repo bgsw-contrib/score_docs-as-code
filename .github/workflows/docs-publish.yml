@@ -60,7 +60,6 @@ jobs:
           if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
             if [[ -z "$PR_NUMBER" && -n "$HEAD_REPO_OWNER" && -n "$REF_NAME" ]]; then
               PR_NUMBER="$(curl -fsSL \
-                -H "Authorization: ******" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/pulls?state=open&head=${HEAD_REPO_OWNER}:${REF_NAME}" \
                 | jq -r '.[0].number // empty' || true)"
@@ -105,10 +104,16 @@ jobs:
           REF_NAME: ${{ steps.metadata.outputs.ref_name }}
         run: |
           if [[ -n "$PR_NUMBER" ]]; then
-            echo "folder=pr-$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            FOLDER="pr-$PR_NUMBER"
           else
-            echo "folder=$REF_NAME" >> "$GITHUB_OUTPUT"
+            FOLDER="$REF_NAME"
           fi
+          FOLDER="$(printf '%s' "$FOLDER" | tr '/[:space:]' '-' | tr -cd 'A-Za-z0-9._-')"
+          if [[ -z "$FOLDER" ]]; then
+            echo "Resolved target folder is empty after sanitization." >&2
+            exit 1
+          fi
+          echo "folder=$FOLDER" >> "$GITHUB_OUTPUT"
 
       - name: Ensure gh-pages branch exists with initial files
         if: steps.metadata.outputs.should_deploy == 'true'
@@ -203,10 +208,16 @@ jobs:
       - name: Guard against gh-pages size limit
         if: steps.metadata.outputs.should_deploy == 'true'
         id: quota
+        env:
+          TARGET_FOLDER: ${{ steps.target.outputs.folder }}
         run: |
+          if [[ ! "$TARGET_FOLDER" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid target folder: $TARGET_FOLDER" >&2
+            exit 1
+          fi
           python .github/scripts/gh_pages_guard.py guard \
             --gh-pages-dir gh-pages-content \
-            --target-folder "${{ steps.target.outputs.folder }}" \
+            --target-folder "$TARGET_FOLDER" \
             --new-size-bytes "${{ steps.payload.outputs.new_size_bytes }}" \
             --warn-limit-bytes "${GH_PAGES_WARN_LIMIT_BYTES}" \
             --hard-limit-bytes "${GH_PAGES_HARD_LIMIT_BYTES}" \
