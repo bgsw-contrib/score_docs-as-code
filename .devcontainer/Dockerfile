@@ -11,30 +11,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # *******************************************************************************
 
-name: Daily Maintenance
-
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  pages: write
-  id-token: write
-
-on:
-  # Runs every day at midnight UTC
-  schedule:
-    - cron: '0 0 * * *'
-
-  # On changes to this workflow file
-  pull_request:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/daily.yml'
-
-  # Manually trigger the workflow from the GitHub UI
-  workflow_dispatch: {}
-
-jobs:
-  maintenance:
-    uses: eclipse-score/cicd-workflows/.github/workflows/daily.yml@8d80e8df150cae21d53cbc8031d0f970648f7a67 # v0.0.3
+# Use Dockerfile to get dependabot version bumps after new image is released
+FROM ghcr.io/eclipse-score/devcontainer:v1.10.0
